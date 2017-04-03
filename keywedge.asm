@@ -1,9 +1,32 @@
-; 8051 Keyboard Wedge, by Simon Hosie - 1997,1998,2000
+; 8051 Keyboard Wedge, by Simon Hosie - 2000-07-10
 ;
 ; Inserts scancodes into the datastream between a keyboard and PC representing the movements on
 ; microcomputer joysticks.
 ;
-; Source and listing are intended to be viewed on a 132 column screen.
+; Copyright (c) 2000 Simon Hosie
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions
+; are met:
+; 1. Redistributions of source code must retain the above copyright
+;    notice, this list of conditions and the following disclaimer.
+; 2. Redistributions in binary form must reproduce the above copyright
+;    notice, this list of conditions and the following disclaimer in the
+;    documentation and/or other materials provided with the distribution.
+; 3. The name of the author may not be used to endorse or promote products
+;    derived from this software without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+; IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+; OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+; IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+; INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+; NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+; DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+; THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+; (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+; THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 $INCLUDE (keywedge.inc)
 
@@ -95,25 +118,19 @@ ResetPt:		ajmp	Main				; <- Click here to begin
 			CSEG	at TIMER1
 			ajmp	Kb_TimerInt
 
-			DB	' * Keywedge 2000-06-29 by Simon Hosie * ', 0
+			DB	' * Keywedge 2000-07-10 by Simon Hosie * ', 0
 
 ; ####################################################################################################
 ; ####################################################################################################
 
-			; 'Super Hoopy Data Throughpy' transparency mode....  Attempts to minimise
+			; `Super Hoopy Data Throughpy' transparency mode....  Attempts to minimise
 			; response times by using a state machine.  In this mode nothing else can be
 			; done, so only use it to hide from startup conditions and backchannel data or
 			; anything else that looks like trouble.
 
-TransparentMode: ;	setb	Js_OutputDisable
-;			setb	Js_ResetStrobe
-;			clr	Js_ResetStrobe
-;			mov	P1, #55h
-;			clr	Js_LEDLatchStrobe
-;			setb	Js_LEDLatchStrobe
-;			mov	P1, #0ffh
-
+TransparentMode: 	StateDebugSetup
 State00:		mov	P3, #P3_DefaultState - (0)
+			StateDebug #0
 			mov	TransTimerMin, #200		; 200 x 10 cycles = 1us
 			mov	TransTimerMaj, A
 State00L:		jnb	Kb_Clock, State20
@@ -123,49 +140,56 @@ State00L:		jnb	Kb_Clock, State20
 			djnz	TransTimerMin, State00L
 			mov	TransTimerMin, #200
 			djnz	TransTimerMaj, State00L
-			mov	TransTimerMaj, A
 			jb	TransparentSwitch, State00L
 			clr	Kb_IntFlag			; Probably got set unintentionally
 			ret
 
 State01:		mov	P3, #P3_DefaultState - (Kb_DataMask)
+			StateDebug #Kb_DataMask
 State01L:		jnb	Kb_Clock, State21
 			jnb	PC_Clock, State11
 			jb	PC_Data, State00
 			sjmp	State01L
 
 State02:		mov	P3, #P3_DefaultState - (PC_DataMask)
+			StateDebug #PC_DataMask
 State02L:		jnb	Kb_Clock, State22
 			jnb	PC_Clock, State12
 			jb	Kb_Data, State00
 			sjmp	State02L
 
 State10:		mov	P3, #P3_DefaultState - (Kb_ClockMask)
+			StateDebug #Kb_ClockMask
 State10L:		jb	PC_Clock, State00
 			jnb	Kb_Data, State12
 			jb	PC_Data, State10L
 
 State11:		mov	P3, #P3_DefaultState - (Kb_ClockMask+Kb_DataMask)
+			StateDebug #Kb_ClockMask+Kb_DataMask
 State11L:		jb	PC_Clock, State01
 			jb	PC_Data, State10
 			sjmp	State11L
 
 State12:		mov	P3, #P3_DefaultState - (Kb_ClockMask+PC_DataMask)
+			StateDebug #Kb_ClockMask+PC_DataMask
 State12L:		jb	PC_Clock, State02
 			jb	Kb_Data, State10
 			sjmp	State12L
 
 State20:		mov	P3, #P3_DefaultState - (PC_ClockMask)
+			StateDebug #PC_ClockMask
 State20L:		jb	Kb_Clock, State00
 			jnb	Kb_Data, State22
 			jb	PC_Data, State20L
 
 State21:		mov	P3, #P3_DefaultState - (PC_ClockMask+Kb_DataMask)
+			StateDebug #PC_ClockMask+Kb_DataMask
 State21L:		jb	Kb_Clock, State01
 			jb	PC_Data, State20
 			sjmp	State21L
 
 State22:		mov	P3, #P3_DefaultState - (PC_ClockMask+PC_DataMask)
+			StateDebug #PC_ClockMask+PC_DataMask
 State22L:		jb	Kb_Clock, State02
 			jb	Kb_Data, State20
 			sjmp	State22L
@@ -288,7 +312,7 @@ Kb_EdgeTableEnd:
 ; ####################################################################################################
 
 			; Watch the data line from the PC.  If it goes low then it's trying to talk to
-			; us.  We want to part of that, so slip into transparent mode.
+			; us.  We want no part of that, so slip into transparent mode.
 
 PC_PollData:		mov	PC_StateIndex, #0
 			jnb	PC_Data, PC_PanicStations	; Duck and Cover!
@@ -387,7 +411,7 @@ Kb_WantParity0:		orl	C, Kb_TransError
 
 Kb_RecvStopBit:		mov	C, Kb_Data
 			cpl	C
-			orl	C, Kb_TransError		; Stop bit should be '1'
+			orl	C, Kb_TransError		; Stop bit should be `1'
 			mov	Kb_TransError, C
 			mov	Kb_StateIndex, #0		; Finished, go idle
 			jc	Kb_RecvError
@@ -745,7 +769,7 @@ UI_PC_NotBlocking:	mov	C, PC_TransError
 Main:			mov	IE, #0				; block ints (in case not usual reset)
 			mov	SP, #StackBase - 1		; set up a stack
 			mov	P1, #0ffh			; safe P1 output
-			mov	P3, #P3_DefaultState		; safe P3 output
+			mov	P3, #0ffh			; safe P3 output
 			mov	TCON, #04h
 			mov	TMOD, #11h			; both timers 16bit
 			mov	IP, #04h			; prioritise only the keyboard ISR
