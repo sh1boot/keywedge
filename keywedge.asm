@@ -13,20 +13,15 @@ PC_TransError:		DBIT	1	; send resend when dust settles
 Kb_TransError:		DBIT	1	; send resend when dust settles
 
 Kb_DeferTimeout:	DBIT	1	; don't set usual timeout period
-Kb_SendSetup:		DBIT	1	; timer interrupt means to start sending data to keyboard
 Kb_Blocking:		DBIT	1	; we're holding the keyboard clock line low, not it
-PC_SoftBlock:		DBIT	1	; PC has disabled scanning for some reason
 
-Kb_ToRespondNow:	DBIT	1	; next byte from keyboard should shortcut queue
-PC_ByteFromQueue:	DBIT	1	; unqueue this byte when sent OK
+PC_DataParity:		DBIT	1	; parity bit for outgoing data
 
 Kb_PrefixMeta2Code:	DBIT	1	; queue E1 in front of next two codes from keyboard
 Kb_PrefixMetaCode:	DBIT	1	; queue E0 in front of next code from keyboard
 Kb_PrefixReleaseCode:	DBIT	1	; queue	F0 in front of next code from keyboard
 Kb_Pre2fixReleaseCode:	DBIT	1	; say "pre-squared-fix", same as above
 Kb_GetMeta2PrefixByte:	DBIT	1	; need the first code of an E1 sequence
-
-PowerupTimeout:		DBIT	1	; interrupt ocurred for powerup delay
 
 QueueFull:		DBIT	1	; queue can't take any more data
 
@@ -48,19 +43,14 @@ Kb_Meta2PrefixByte:	DS	1	; first code of E1 sequence
 Kb_ShiftBuffer:		DS	1	; workspace for transfer
 PC_ShiftBuffer:		DS	1
 
-PC_ByteToSend:		DS	1	; good copy of outgoing data
-Kb_ByteToSend:		DS	1
-
-PC_LastByteSent:	DS	1	; for resend requests
-Kb_LastByteSent:	DS	1
-
-PowerupCountdown:	DS	1	; extension on timer 1 for powerup delay
+TransTimerMin:		DS	1	; countdown for transparent mode
+TransTimerMaj:		DS	1
 PollCountdown:		DS	1	; countdown to joystick poll
 
 KeyboardState:		DS	NumJoysticks	; state of joystick buttons
 JoystickState:		DS	NumJoysticks	; state of keys that map to joystick buttons
 
-StackBase:		DS	20h	; put the stack here
+StackBase:		DS	20h	; Stack grows upward from here.
 
 ; ----------------------------------------------------------------------------------------------
 
@@ -69,116 +59,116 @@ DvorakSwitch		BIT	DIPSwitchState.1	; controls Dvorak keyboard translation
 DropWinkeySwitch	BIT	DIPSwitchState.2	; unused, but would be a nice feature
 IndicatorBankSwitch	BIT	DIPSwitchState.7	; toggles between two display modes
 
-PC_TXIndicator		BIT	LEDStateA.0
-PC_RXIndicator		BIT	LEDStateA.1
+PC_WildIndicator	BIT	LEDStateA.0
+Kb_WildIndicator	BIT	LEDStateA.1
 PC_BlockingIndicator	BIT	LEDStateA.2
-PC_ErrorIndicator	BIT	LEDStateA.3
-Kb_TXIndicator		BIT	LEDStateA.4
+Kb_BlockingIndicator	BIT	LEDStateA.3
+PC_TXIndicator		BIT	LEDStateA.4
 Kb_RXIndicator		BIT	LEDStateA.5
-Kb_BlockingIndicator	BIT	LEDStateA.6
+PC_ErrorIndicator	BIT	LEDStateA.6
 Kb_ErrorIndicator	BIT	LEDStateA.7
 
-MetaPrefixIndicator	BIT	LEDStateB.0
-Meta2PrefixIndicator	BIT	LEDStateB.1
-ReleasePrefixIndicator	BIT	LEDStateB.2
-RespondNowIndicator	BIT	LEDStateB.3
-QueueOverrunIndicator	BIT	LEDStateB.6
-QueueFullIndicator	BIT	LEDStateB.7
+QueueNonEmptyIndicator	BIT	LEDStateB.0
+QueueFullIndicator	BIT	LEDStateB.1
+QueueOverrunIndicator	BIT	LEDStateB.2
+PollingBlinker		BIT	LEDStateB.4
+MetaPrefixIndicator	BIT	LEDStateB.5
+Meta2PrefixIndicator	BIT	LEDStateB.6
+ReleasePrefixIndicator	BIT	LEDStateB.7
 
 ; ##############################################################################################
+; ##############################################################################################
+
+; Maybe Intel got it right for some situation with their ISR handling
+; structure, but certainly not this situation.  Give away some ROM space to
+; code readability.
 
 			CSEG	at RESET
 ResetPt:		ajmp	Main				; <- Click here to begin
 
 			CSEG	at EXTI0
-			clr	PC_IntEnable			; goes low when PC blocks
-			clr	PC_TimerRun			; (level triggered)
-			setb	PC_Data
 			ajmp	PC_LowInt
 
 			CSEG	at TIMER0
-			clr	PC_TimerRun			; time to change PC clock state
-			push	PSW
-			push	ACC
 			ajmp	PC_TimerInt
 
 			CSEG	at EXTI1
-			clr	Kb_TimerRun			; keyboard clock dropped
-			push	PSW
-			push	ACC
 			ajmp	Kb_EdgeInt
 
 			CSEG	at TIMER1
-			ajmp	Kb_TimerInt			; keyboard timed out or
-								; miscellaneous event
+			ajmp	Kb_TimerInt
+
+; ----------------------------------------------------------------------------------------------
+
+			DB	'  Simon is cool!  ', 0
 
 ; ##############################################################################################
 ; ##############################################################################################
 
 ; 'Super Hoopy Data Throughpy' transparency mode.
-;	State machine to minimise response times to changes in lines, useful
-;	for situations that can't be resolved by general simulation such as
-;	unexpected protocol extensions or strange powerup conditions.
+;	Attempts to minimise response times by using a state machine.
 
-;	Each state begins by setting outputs to match inputs, then waiting
-;	for an input to change and branching to the new state which will in
-;	turn reconfigure outputs to fit and wait for the next change. 
-;	Extremely inefficient in terms of ROM usage, but reliable.
+TransparentMode:	setb	Js_OutputDisable
+			setb	Js_ResetStrobe
+			clr	Js_ResetStrobe
+			mov	P1, #55h
+			clr	Js_LEDLatchStrobe
+			setb	Js_LEDLatchStrobe
+			mov	P1, #0ffh
 
-TransparentMode:
 State00:		mov	P3, #P3_DefaultState - (0)
-			mov	TH1, #00
+			mov	TransTimerMin, #200		; 200 x 10 cycles = 1us
+			mov	TransTimerMaj, A
 State00L:		jnb	Kb_Clock, State20
 			jnb	PC_Clock, State10
 			jnb	Kb_Data, State02
-			jb	PC_Data, State00L
+			jnb	PC_Data, State01
+			djnz	TransTimerMin, State00L
+			mov	TransTimerMin, #200
+			djnz	TransTimerMaj, State00L
+			mov	TransTimerMaj, A
+			jb	TransparentSwitch, State00L
+			clr	Kb_IntFlag			; Probably got set unintentionally
+			ret
 
 State01:		mov	P3, #P3_DefaultState - (Kb_DataMask)
-			mov	TH1, #00
 State01L:		jnb	Kb_Clock, State21
 			jnb	PC_Clock, State11
 			jb	PC_Data, State00
 			sjmp	State01L
 
 State02:		mov	P3, #P3_DefaultState - (PC_DataMask)
-			mov	TH1, #00
 State02L:		jnb	Kb_Clock, State22
 			jnb	PC_Clock, State12
 			jb	Kb_Data, State00
 			sjmp	State02L
 
 State10:		mov	P3, #P3_DefaultState - (Kb_ClockMask)
-			mov	TH1, #00
 State10L:		jb	PC_Clock, State00
 			jnb	Kb_Data, State12
 			jb	PC_Data, State10L
 
 State11:		mov	P3, #P3_DefaultState - (Kb_ClockMask+Kb_DataMask)
-			mov	TH1, #00
 State11L:		jb	PC_Clock, State01
 			jb	PC_Data, State10
 			sjmp	State11L
 
 State12:		mov	P3, #P3_DefaultState - (Kb_ClockMask+PC_DataMask)
-			mov	TH1, #00
 State12L:		jb	PC_Clock, State02
 			jb	Kb_Data, State10
 			sjmp	State12L
 
 State20:		mov	P3, #P3_DefaultState - (PC_ClockMask)
-			mov	TH1, #00
 State20L:		jb	Kb_Clock, State00
 			jnb	Kb_Data, State22
 			jb	PC_Data, State20L
 
 State21:		mov	P3, #P3_DefaultState - (PC_ClockMask+Kb_DataMask)
-			mov	TH1, #00
 State21L:		jb	Kb_Clock, State01
 			jb	PC_Data, State20
 			sjmp	State21L
 
 State22:		mov	P3, #P3_DefaultState - (PC_ClockMask+PC_DataMask)
-			mov	TH1, #00
 State22L:		jb	Kb_Clock, State02
 			jb	Kb_Data, State20
 			sjmp	State22L
@@ -186,10 +176,75 @@ State22L:		jb	Kb_Clock, State02
 ; ##############################################################################################
 ; ##############################################################################################
 
+; PC blocking detector.  This may be strobed for as little as 60us to
+; interrupt transmission, so polling it would not be adequate.  Just abandon
+; any transfer in the process.  The rest of the transmission code must be
+; (and is) structured such that it can resume where it left off without data
+; loss.
+
+PC_LowInt:		clr	PC_IntEnable
+			mov	PC_StateIndex, #PC_ClockLowStatePtr-PC_TimerTable
+			PC_SetupTimer BlockPollTime
+			reti
+
+; PC clock timer and polling timer.  Just do as the jump table dictates.
+
+PC_TimerInt:		clr	PC_TimerRun
+			push	PSW
+			push	ACC
+			push	DPL
+			push	DPH
+			mov	DPTR, #PC_TimerTable
+			mov	A, PC_StateIndex
+			inc	PC_StateIndex
+			inc	PC_StateIndex
+			acall	JmpAPlusDPtr
+			pop	DPH
+			pop	DPL
+			pop	ACC
+			pop	PSW
+			reti
+
+; Keyboard clock input.  Applicable to data going in either direction.
+
+Kb_EdgeInt:		clr	Kb_TimerRun
+			push	PSW
+			push	ACC
+			push	DPL
+			push	DPH
+			mov	DPTR, #Kb_EdgeTable
+			mov	A, Kb_StateIndex
+			inc	Kb_StateIndex
+			inc	Kb_StateIndex
+			acall	JmpAPlusDPtr
+			jbc	Kb_DeferTimeout, Kb_WithoutTimeout
+			Kb_SetupTimer ClockPeriodTimeout
+Kb_WithoutTimeout:	pop	DPH
+			pop	DPL
+			pop	ACC
+			pop	PSW
+			reti
+
+; Keyboard timeout timer.  Flags transfer as erroneous and resets the state
+; pointer, unless there was no transfer being made.
+
+Kb_TimerInt:		clr	Kb_TimerRun
+			push	PSW
+			cjne	Kb_StateIndex, #0, Kb_TransTimeout
+			pop	PSW
+			reti
+Kb_TransTimeout:	setb	Kb_TransError
+			mov	Kb_StateIndex, #0
+			pop	PSW
+			reti
+
+; ##############################################################################################
+; ##############################################################################################
+
 JmpAPlusDPtr:		jmp	@A+DPTR				; used in lieu of a relative call
 
-PC_TimerTable:		nop
-			nop
+PC_TimerTable:		ajmp	PC_PollData
+  PC_ClockLowStatePtr:	ajmp	PC_PollClock
   PC_SendStatePtr:	ajmp	PC_RaiseClock
 			ajmp	PC_SendDataBit
 			ajmp	PC_RaiseClock
@@ -211,32 +266,7 @@ PC_TimerTable:		nop
 			ajmp	PC_RaiseClock
 			ajmp	PC_SendStopBit
 			ajmp	PC_FinishSend
-  PC_NextByteStatePtr:	ajmp	PC_SendNextOrIdle
-
-  PC_RecvStatePtr:	ajmp	PC_DropClock
-			ajmp	PC_RecvDataBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvDataBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvDataBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvDataBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvDataBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvDataBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvDataBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvDataBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvParityBit
-			ajmp	PC_DropClock
-			ajmp	PC_RecvStopBit
-			ajmp	PC_DropClock
-			ajmp	PC_EndAcknowledge
-
-  PC_LowClockStatePtr:	ajmp	PC_CheckLowClock
+PC_TimerTableEnd:
 
 Kb_EdgeTable:
   Kb_WaitingStatePtr:	ajmp	Kb_RecvStartBit
@@ -250,137 +280,66 @@ Kb_EdgeTable:
 			ajmp	Kb_RecvDataBit
 			ajmp	Kb_RecvParityBit
 			ajmp	Kb_RecvStopBit
-
-  Kb_SendStatePtr:	ajmp	Kb_SendDataBit
-			ajmp	Kb_SendDataBit
-			ajmp	Kb_SendDataBit
-			ajmp	Kb_SendDataBit
-			ajmp	Kb_SendDataBit
-			ajmp	Kb_SendDataBit
-			ajmp	Kb_SendDataBit
-			ajmp	Kb_SendDataBit
-			ajmp	Kb_SendParityBit
-			ajmp	Kb_SendStopBit
-			ajmp	Kb_SeeAcknowledge
+Kb_EdgeTableEnd:
 
 ; ##############################################################################################
-; ##############################################################################################
 
-; If the PC clock line is driven low while this IRQ is enabled then we
-; didn't expect it.  Abandon any data transfer and start polling the line at
-; a moderate rate.  Thus far there is no reason to abort any communications
-; with the keyboard or stop polling joysticks.
+; Poll the clock line from the keyboard to see when it's released.  If it is
+; then fall through to checking to see if it was trying to communicate.
 
-PC_LowInt:		mov	PC_StateIndex, #PC_LowClockStatePtr - PC_TimerTable
+PC_PollClock:		mov	PC_StateIndex, #PC_ClockLowStatePtr-PC_TimerTable
+			jb	PC_Clock, PC_ClockRaised
 			PC_SetupTimer BlockPollTime
-			reti
+			ret
+PC_ClockRaised:		setb	PC_IntEnable
 
-; ----------------------------------------------------------------------------------------------
+; Watch the data line from the PC.  If it goes low then it's trying to talk
+; to us.  We want to part of that, so slip into transparent mode.
 
-PC_TimerInt:		push	DPL
-			push	DPH
-			mov	DPTR, #PC_TimerTable
-			mov	A, PC_StateIndex
-			inc	PC_StateIndex
-			inc	PC_StateIndex
-			acall	JmpAPlusDPtr
-			pop	DPH
-			pop	DPL
-			pop	ACC
-			pop	PSW
-			reti
+PC_PollData:		mov	PC_StateIndex, #0
+			jnb	PC_Data, PC_PanicStations	; Duck and Cover!
+			acall	PeekQueue
+			jc	PC_StayIdle
+			mov	PC_StateIndex, #PC_SendStatePtr-PC_TimerTable
+			mov	PC_ShiftBuffer, A
+			mov	C, P
+			cpl	C
+			mov	PC_DataParity, C
+			clr	PC_Data				; prepare start bit
+			ajmp	PC_DropClock
+PC_StayIdle:		PC_SetupTimer BackChanPollTime
+			ret
 
-; ----------------------------------------------------------------------------------------------
+; The PC is trying to communicate.  Stay out of the way until the lines
+; settle.  20 milliseconds is the maximum latency for the keyboard response,
+; so wait for that long after the traffic settles to ensure that whatever
+; needed to be done has been done.
 
-Kb_EdgeInt:		push	DPL
-			push	DPH
-			mov	DPTR, #Kb_EdgeTable
-			mov	A, Kb_StateIndex
-			inc	Kb_StateIndex
-			inc	Kb_StateIndex
-			acall	JmpAPlusDPtr
-			jbc	Kb_DeferTimeout, Kb_WithoutTimeout
-			Kb_SetupTimer ClockPeriodTimeout
-Kb_WithoutTimeout:	pop	DPH
-			pop	DPL
-			pop	ACC
-			pop	PSW
-			reti
+PC_PanicStations:	clr	EA
+			mov	A, #22				; 20 milliseconds is maximum
+			acall	TransparentMode			; latency for keyboard response
+			mov     Kb_StateIndex, #0
+			setb	EA
+			ajmp	PC_PollData
 
-; ----------------------------------------------------------------------------------------------
-
-; Check all sorts of miscellaneous conditions here.  The keyboard timeout is
-; the least timing critical and so it's multiplexed with other non-critical
-; timers.
-;
-; If the PowerupTimeout bit is set then we're currently pretending to be
-; transparent for fear of striking trouble with the power up sequence. 
-; Count that down and at timeout break out of the currently running
-; function.
-;
-; If the Kb_SendSetup bit is set then we've been holding the clock and data
-; lines low to indicate to the keyboard that we want to send data.  That
-; time is up, so begin the transfer.
-;
-; Otherwise something has gone wrong.  Flag the transfer as bad.
-
-Kb_TimerInt:		jb	PowerupTimeout, PowerupInt
-			clr	Kb_TimerRun
-			jbc	Kb_SendSetup, Kb_StartTransfer
-			clr	Kb_ToRespondNow
-			push	PSW
-			cjne	Kb_StateIndex, #0, Kb_TransTimeout
-;			clr	Kb_ToRespondNow
-			pop	PSW
-			reti
-Kb_TransTimeout:	setb	Kb_TransError
-			mov	Kb_StateIndex, #0
-Kb_NoTransTimeout:	pop	PSW
-			reti
-Kb_StartTransfer:	clr	Kb_IntFlag
-			setb	Kb_Clock
-			setb	Kb_IntEnable
-			Kb_SetupTimer ClockPeriodTimeout
-			reti
-
-PowerupInt:		djnz    PowerupCountdown, PowerupDontFinish
-			inc	PowerupCountdown		; so it always dec's to zero
-			clr	PowerupTimeout
-			clr	Kb_TimerRun
-			dec	SP				; break out of current function
-			dec	SP				; (known to be TransparentMode)
-PowerupDontFinish:	reti
-
-; ##############################################################################################
-
-; A bunch of small modules that are executed as dictated by the jump tables. 
-; Each module does little or no more than what its label indicates.
+; Some self explanatory stuff...
 
 PC_RaiseClock:		setb	PC_Clock
 			setb	PC_IntEnable
 			PC_SetupTimer ClockPhase
 			ret
 
-PC_DropClock:		clr	PC_IntEnable
-			clr	PC_Clock
-PC_SetupNextPhase:	PC_SetupTimer ClockPhase
-			ret
-
-; ----------------------------------------------------------------------------------------------
-
 PC_SendDataBit:		mov	A, PC_ShiftBuffer
 			rrc	A
 			mov	PC_Data, C
 			mov	PC_ShiftBuffer, A
-			ajmp	PC_DropClock
+PC_DropClock:		clr	PC_IntEnable
+			clr	PC_Clock
+			PC_SetupTimer ClockPhase
+			ret
 
-PC_SendParityBit:	clr	A
-			xch	A, PC_ByteToSend
-			mov	C, P
-			cpl	C
+PC_SendParityBit:	mov	C, PC_DataParity
 			mov	PC_Data, C
-			cje	A, #ResendCode, PC_DropClock	; don't log RESEND for resending
-			mov	PC_LastByteSent, A
 			ajmp	PC_DropClock
 
 PC_SendStopBit:		setb	PC_Data
@@ -389,81 +348,15 @@ PC_SendStopBit:		setb	PC_Data
 PC_FinishSend:		setb	PC_Clock
 			setb	PC_IntEnable
 			setb	PC_Data				; being cautious
-			acall	PC_SentByte
+			acall	UnqueueByte
+			mov	PC_StateIndex, #0
 			PC_SetupTimer PostByteDelay		; for badly written software
 			ret
 
-PC_SendNextOrIdle:	mov	PC_StateIndex, #0
-			acall	PeekQueue
-			setb	PC_ByteFromQueue
-			jc	PC_GoIdle
-			ajmp	PC_StartSend
-PC_GoIdle:		ret
-
 ; ----------------------------------------------------------------------------------------------
 
-PC_RecvDataBit:		setb	PC_Clock
-			setb	PC_IntEnable
-			mov	C, PC_Data
-			mov	A, PC_ShiftBuffer
-			rrc	A
-			mov	PC_ShiftBuffer, A
-			ajmp	PC_SetupNextPhase
-
-PC_RecvParityBit:	setb	PC_Clock
-			setb	PC_IntEnable
-			mov	C, PC_Data
-			mov	A, PC_ShiftBuffer
-			jb	P, PC_WantParity0
-			cpl	C
-PC_WantParity0:		orl	C, PC_TransError
-			mov	PC_TransError, C
-			ajmp	PC_SetupNextPhase
-
-PC_RecvStopBit:		setb	PC_Clock
-			setb	PC_IntEnable
-			jb	PC_Data, PC_Acknowledge
-			setb	PC_TransError
-			dec	PC_StateIndex			; try to clock in a stop bit
-			dec	PC_StateIndex			; before continuing
-			dec	PC_StateIndex
-			dec	PC_StateIndex
-			ajmp	PC_SetupNextPhase
-PC_Acknowledge:		clr	PC_Data
-			ajmp	PC_SetupNextPhase
-
-PC_EndAcknowledge:	setb	PC_Clock
-			setb	PC_IntEnable
-			setb	PC_Data
-			mov	PC_StateIndex, #0
-			mov	A, PC_ShiftBuffer
-			cjne	A, #ResendCode, PC_NotResendReq
-			mov	A, PC_LastByteSent
-			ajmp	PC_StartSend
-PC_NotResendReq:	ajmp	PC_GotByte
-
-; ----------------------------------------------------------------------------------------------
-
-PC_CheckLowClock:	jb	PC_Clock, PC_ClockRaised
-			mov	PC_StateIndex, #PC_LowClockStatePtr - PC_TimerTable
-			PC_SetupTimer BlockPollTime
-			ret
-
-PC_ClockRaised:		setb	PC_IntEnable
-			jb	PC_Data, PC_JustBlocking
-			clr	PC_TransError
-			mov	PC_StateIndex, #PC_RecvStatePtr - PC_TimerTable
-			PC_SetupTimer ClockPhase
-			ret
-
-PC_JustBlocking:	mov	PC_StateIndex, #PC_NextByteStatePtr - PC_TimerTable
-			PC_SetupTimer PostByteDelay
-			ret
-
-; ----------------------------------------------------------------------------------------------
-
-Kb_RecvStartBit:	mov	C, Kb_Data
-			mov	Kb_TransError, C
+Kb_RecvStartBit:	mov	C, Kb_Data			; Start bit should be zero...
+			mov	Kb_TransError, C		; ...else it's an error already
 			ret
 
 Kb_RecvDataBit:		mov	C, Kb_Data
@@ -486,79 +379,24 @@ Kb_RecvStopBit:		mov	C, Kb_Data
 			mov	Kb_TransError, C
 			mov	Kb_StateIndex, #0
 			setb	Kb_DeferTimeout
-			jnc	Kb_RecvOK
-			mov	A, #ResendCode
-			ajmp	Kb_StartSend
-Kb_RecvOK:		mov	A, Kb_ShiftBuffer
-			cjne	A, #ResendCode, Kb_NotResendReq
-			mov	A, Kb_LastByteSent
-			ajmp	Kb_StartSend
-Kb_NotResendReq:	clr     Kb_Clock
+			jc	Kb_RecvError
+			mov	A, Kb_ShiftBuffer
+			clr     Kb_Clock
 			acall	Kb_GotByte
-			setb	Kb_Clock
-			ret
-
-; ----------------------------------------------------------------------------------------------
-
-Kb_SendDataBit:		mov	A, Kb_ShiftBuffer
-			rrc	A
-			mov	Kb_Data, C
-			mov	Kb_ShiftBuffer, A
-			ret
-
-Kb_SendParityBit:	clr	A
-			xch	A, Kb_ByteToSend
-			mov	C, P
+			mov	C, Kb_Blocking
 			cpl	C
-			mov	Kb_Data, C
-			cjne	A, #ResendCode, Kb_NotResendCode
-			ret
-Kb_NotResendCode:	mov	Kb_LastByteSent, A
-			ret
-
-Kb_SendStopBit:		setb	Kb_Data
-			ret
-
-Kb_SeeAcknowledge:	mov	Kb_StateIndex, #0
-			setb	Kb_DeferTimeout
-			jb	Kb_Data, Kb_AckFailed
-			ajmp	Kb_SentByte
-Kb_AckFailed:		ret
+			mov	Kb_Clock, C
+			clr	Kb_IntFlag
+Kb_RecvError:		ret
 
 ; ##############################################################################################
 
-; We got a byte from the PC.  All we know how to do is send it on to the
-; keyboard and wait for its response.
+; We got a byte from the keyboard.  Rather than attempting to queue prefix
+; bytes as they arrive and having to block the queue until the entire
+; sequence has arrived (requiring another timeout), simply flag the required
+; prefixes and queue them all when there's something to attach them to.
 
-PC_GotByte:		setb	Kb_ToRespondNow
-			ajmp	Kb_StartSend
-
-; ----------------------------------------------------------------------------------------------
-
-; We sent a byte to the PC successfully.  If it came from the queue then get
-; rid of it.
-
-PC_SentByte:		jnbc	PC_ByteFromQueue, PCSB_DontUnqueue
-			ajmp	UnqueueByte
-PCSB_DontUnqueue:	ret
-
-; ----------------------------------------------------------------------------------------------
-
-; We got a byte from the keyboard.  If we were expecting a response to a
-; command then check that it's valid and send it on if it is, if not then
-; keep waiting until timeout.  Otherwise analyse and/or queue it.
-
-Kb_GotByte:		jnb	Kb_ToRespondNow, Kb_DontRespondNow
-			jnb	ACC.7, Kb_NotResponseCode	; scancodes aren't responses
-			cje	A, #83h, Kb_NotResponseCode	; F7 is a confused key
-			cje	A, #MetaCode, Kb_NotResponseCode
-			cje	A, #Meta2Code, Kb_NotResponseCode
-			cje	A, #ReleaseCode, Kb_NotResponseCode
-			clr	Kb_ToRespondNow			; we got something we can use as
-			ajmp	PC_StartSend			; a response
-Kb_NotResponseCode:	Kb_SetupTimer ResponseTimeout
-
-Kb_DontRespondNow:	jbc     Kb_GetMeta2PrefixByte, Kb_GotMeta2PrefixByte
+Kb_GotByte:		jbc     Kb_GetMeta2PrefixByte, Kb_GotMeta2PrefixByte
 
 			cjne	A, #MetaCode, Kb_NotMetaCode
 			setb	Kb_PrefixMetaCode
@@ -571,22 +409,31 @@ Kb_NotMeta2Code:	cjne	A, #ReleaseCode, Kb_NotReleaseCode
 			setb	Kb_PrefixReleaseCode
 			ret
 
-Kb_NotReleaseCode:	jnb	DvorakSwitch, Kb_DontTranslateIt
+; Meta codes have all been taken aside at this point, if we're still running
+; then we have a real keycode.  First consider applying Dvorak translation
+; to it.
+
+Kb_NotReleaseCode:	jnb	DvorakSwitch, Kb_SkipDvorak
 			cmp	A, #15h
-			jc	Kb_DontTranslateIt
+			jc	Kb_SkipDvorak
 			cmp	A, #5ch
-			jnc	Kb_DontTranslateIt
+			jnc	Kb_SkipDvorak
 			mov	DPTR, #DvorakTransTable - 15h
 			movc	A, @A+DPTR
 
-	; ...input translation done, now try to output the thing...
+; Next see if it needs to be thrown out for conflicting with the state of a
+; joystick.
 
-Kb_DontTranslateIt:	jb      Kb_PrefixMeta2Code, Kb_DontDiscard
+Kb_SkipDvorak:		jb      Kb_PrefixMeta2Code, Kb_DontDiscard
 			jb      Kb_PrefixMetaCode, Kb_DontDiscard
 			acall   Kb_CheckCode
 			jnc	Kb_DontDiscard
 			clr	Kb_PrefixReleaseCode
 			ret
+
+; Stuff everything in the queue all at once, now.  This is only ever called
+; with the highest interrupt priority, so don't bother blocking other
+; interrupts to avoid fragmentation.
 
 Kb_DontDiscard:		jnbc	Kb_PrefixMeta2Code, Kb_NoMeta2Prefix
 			QuickQueue #Meta2Code
@@ -598,50 +445,24 @@ Kb_NoMeta2Prefix:	jnbc	Kb_PrefixMetaCode, Kb_NoMetaPrefix
 			QuickQueue #MetaCode
 Kb_NoMetaPrefix:	mov	C, Kb_PrefixReleaseCode
 			clr	Kb_PrefixReleaseCode
+
+; Queue the actual byte with the official call for full functionality.  If
+; the queue is full (carry is set) then stop the keyboard from sending any
+; more data by forcing the clock line low.
+
 			acall	QueueByte
-			jnc	Kb_DontStartBlocking
-			setb	Kb_Blocking
-			clr	Kb_IntEnable
-			clr	Kb_Clock
-Kb_DontStartBlocking:	ret
+			mov	Kb_Blocking, C
+			cpl	C
+			mov	Kb_Clock, C
+			clr	Kb_IntFlag
+			mov	Kb_IntEnable, C
+			ret
 
 Kb_GotMeta2PrefixByte:	cjne	A, #ReleaseCode, Kb_NotReleaseCode_2
 			setb	Kb_Pre2fixReleaseCode
 			setb	Kb_GetMeta2PrefixByte
 			ret
 Kb_NotReleaseCode_2:	mov	Kb_Meta2PrefixByte, A
-			ret
-
-; ----------------------------------------------------------------------------------------------
-
-; We send a byte to the keyboard successfully.  Expect a reply.
-
-Kb_SentByte:		Kb_SetupTimer ResponseTimeout
-			setb	Kb_ToRespondNow
-			ret
-
-; ==============================================================================================
-
-PC_StartSend:		cjne    PC_StateIndex, #0, PCSS_ForgetSend
-			clr	PC_IntEnable
-			clr	PC_Data
-			clr	PC_Clock
-			mov	PC_ShiftBuffer, A
-			mov	PC_ByteToSend, A
-			mov	PC_StateIndex, #PC_SendStatePtr - PC_TimerTable
-			PC_SetupTimer ClockPhase
-PCSS_ForgetSend:	ret
-
-; ----------------------------------------------------------------------------------------------
-
-Kb_StartSend:		clr	Kb_IntEnable
-			clr	Kb_Clock
-			clr	Kb_Data
-			mov	Kb_ShiftBuffer, A
-			mov	Kb_ByteToSend, A
-			mov	Kb_StateIndex, #Kb_SendStatePtr - Kb_EdgeTable
-			setb	Kb_SendSetup
-			Kb_SetupTimer BlockHoldTime
 			ret
 
 ; ##############################################################################################
@@ -747,22 +568,19 @@ QueueByte:		clr	EA
 			QuickQueue #ReleaseCode
 QB_PressOnly:		QuickQueue A
 			setb	EA
+			clr	PC_TimerRun
 			cjne	PC_StateIndex, #0, QB_JustQueueIt
-;			jb	Kb_ToRespondNow, QB_JustQueueIt
-			push	ACC
-			acall	PeekQueue
-			setb	PC_ByteFromQueue
-			acall	PC_StartSend
-			pop	ACC
-QB_JustQueueIt:		cmp	QueueEndPtr, #QueueBase+QueueThreshold
+			PC_SetupTimer 0ffffh
+QB_JustQueueIt:		setb	PC_TimerRun
+			cmp	QueueEndPtr, #QueueBase+QueueThreshold
 			cpl	C
 			mov	QueueFull, C
 			ret
 
 ; ----------------------------------------------------------------------------------------------
 
-PeekQueue:		cmp	QueueEndPtr, #QueueBase+1
-			mov	A, QueueBase
+PeekQueue:		cmp	QueueEndPtr, #QueueBase+1	; set carry on nonempty queue
+			mov	A, QueueBase			; grab next byte to send
 			ret
 
 ; ----------------------------------------------------------------------------------------------
@@ -887,48 +705,42 @@ ForceDIPSwitchUpdate:	acall	ForceLEDUpdate
 ; Maybe someone will build an extension module to control disco lights based
 ; on keystrokes.
 
-UpdateIndicators:	cmp	PC_StateIndex, #PC_SendStatePtr-PC_TimerTable
-			mov	F0, C
-			cmp	PC_StateIndex, #PC_NextByteStatePtr-PC_TimerTable
-			anl	C, /F0
+UpdateIndicators:	cmp	PC_StateIndex, #PC_SendStatePtr+2-PC_TimerTable
+			cpl	C
 			mov	PC_TXIndicator, C
-
-			cmp	PC_StateIndex, #PC_RecvStatePtr-PC_TimerTable
-			mov	F0, C
-			cmp	PC_StateIndex, #PC_LowClockStatePtr-PC_TimerTable
-			anl	C, /F0
-			mov	PC_RXIndicator, C
-
-			cmp	Kb_StateIndex, #Kb_SendStatePtr-Kb_EdgeTable
+			cmp	Kb_StateIndex, #2
 			cpl	C
-			mov	Kb_TXIndicator, C
-
-			cmp	Kb_StateIndex, #Kb_WaitingStatePtr+2-Kb_EdgeTable
-			mov	F0, C
-			cmp	Kb_StateIndex, #Kb_SendStatePtr-Kb_EdgeTable
-			anl	C, /F0
 			mov	Kb_RXIndicator, C
-
-			cmp	PC_StateIndex, #PC_LowClockStatePtr-PC_TimerTable
-			cpl	C
-			mov	PC_BlockingIndicator, C
-
-			mov	C, Kb_Blocking
-			mov	Kb_BlockingIndicator, C
-
-			mov	A, QueueEndPtr
-			cmp	A, #QueueBase+QueueThreshold
-			cpl	C
-			mov	QueueFullIndicator, C
-
-			cmp	A, #QueueBase+QueueLength
-			cpl	C
-			mov	QueueOverrunIndicator, C
 
 			mov	C, PC_TransError
 			mov	PC_ErrorIndicator, C
 			mov	C, Kb_TransError
 			mov	Kb_ErrorIndicator, C
+
+			mov	C, Kb_Blocking
+			mov	Kb_BlockingIndicator, C
+			clr	PC_BlockingIndicator
+			cjne	PC_StateIndex, #PC_ClockLowStatePtr-PC_TimerTable, UI_PC_NotBlocking
+			setb	PC_BlockingIndicator
+
+UI_PC_NotBlocking:	cmp	PC_StateIndex, #PC_TimerTableEnd-PC_TimerTable
+			cpl	C
+			mov	PC_WildIndicator, C
+
+			cmp	Kb_StateIndex, #Kb_EdgeTableEnd-Kb_EdgeTable
+			cpl	C
+			mov	Kb_WildIndicator, C
+
+			mov	A, QueueEndPtr
+			cmp	A, #QueueBase+1
+			cpl	C
+			mov	QueueNonEmptyIndicator, C
+			cmp	A, #QueueBase+QueueThreshold
+			cpl	C
+			mov	QueueFullIndicator, C
+			cmp	A, #QueueBase+QueueLength
+			cpl	C
+			mov	QueueOverrunIndicator, C
 
 			mov	C, Kb_PrefixMetaCode
 			mov	MetaPrefixIndicator, C
@@ -936,8 +748,6 @@ UpdateIndicators:	cmp	PC_StateIndex, #PC_SendStatePtr-PC_TimerTable
 			mov	Meta2PrefixIndicator, C
 			mov	C, Kb_PrefixReleaseCode
 			mov	ReleasePrefixIndicator, C
-			mov	C, Kb_ToRespondNow
-			mov	RespondNowIndicator, C
 			ret
 
 ; ##############################################################################################
@@ -964,19 +774,11 @@ ClearRAMLoop:		mov	@R0, A
 								; lines were waggled before is
 								; undefined)
 
-			mov	IE, #08h			; prepare timer 1 only
-
 			mov	LEDStateA, #033h		; show that we're in
 			acall	ForceDIPSwitchUpdate		; transparent mode
 
-			mov	PowerupCountdown, #4ch		; about 2.5 seconds
-			setb	PowerupTimeout			; timer is for transparency
-			setb	Kb_TimerRun
-			mov	C, TransparentSwitch		; if switched into transparent
-			cpl	C				; mode then...
-			mov	EA, C				; ...never timeout
-			acall	TransparentMode			; Powerup conditions unknown, just
-								; keep out of the way
+			mov	A, #200				; Powerup conditions unknown, just
+			acall	TransparentMode			; keep out of the way
 
 			mov	IE, #8fh			; enable all interrupts
 			mov	LEDStateA, #00h			; clear 
@@ -985,6 +787,7 @@ MainLoop:		acall	UpdateIndicators		; see what's going on
 			acall	ForceLEDUpdate			; show it to the world
 			djnz	PollCountdown, MainLoop
 			acall	PollAllJoysticks		; poll joysticks every 256
+			cpl	PollingBlinker
 			ajmp	MainLoop			; iterations of above (~80Hz)
 
 ; ##############################################################################################

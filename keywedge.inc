@@ -1,8 +1,7 @@
-$NOPRINT
 $NOPAGING
 $PAGEWIDTH (132)
 $NOMOD
-$DEBUG
+$NODEBUG
 $INCLUDE (89C1051.mcu)
 
 QueueEndPtr		EQU	R0
@@ -60,24 +59,29 @@ WinMenuCode		EQU	02fh	; with Meta
 WinLeftCode		EQU	01fh	; with Meta
 WinRightCode		EQU	027h	; with Meta
 
+HzCrystalFrequency	EQU	24
+CrystalDivisor		EQU	12
+
 usClockPhase		EQU	32
 usClockPeriod		EQU	(usClockPhase * 2)
 usClockPeriodTimeout	EQU	(usClockPeriod * 8)
 usResponseTimeout	EQU	20000
 usBlockPollTime		EQU	80
+usBackChanPollTime	EQU	6000
 usBlockHoldTime		EQU	200
 usPostByteDelay		EQU	100
-HzCrystalFrequency	EQU	24
-CrystalDivisor		EQU	12
 
 ClockPhase		EQU	-(usClockPhase		* HzCrystalFrequency / CrystalDivisor)
 ClockPeriod		EQU	-(usClockPeriod		* HzCrystalFrequency / CrystalDivisor)
 ClockPeriodTimeout	EQU	-(usClockPeriodTimeout	* HzCrystalFrequency / CrystalDivisor)
 BlockPollTime		EQU	-(usBlockPollTime	* HzCrystalFrequency / CrystalDivisor)
+BackChanPollTime	EQU	-(usBackChanPollTime	* HzCrystalFrequency / CrystalDivisor)
 BlockHoldTime		EQU	-(usBlockHoldTime	* HzCrystalFrequency / CrystalDivisor)
 PostByteDelay		EQU	-(usPostByteDelay	* HzCrystalFrequency / CrystalDivisor)
 ResponseTimeout		EQU	-(usResponseTimeout	* HzCrystalFrequency / CrystalDivisor)
 
+; things I do often enough to macro but that don't warrant a call or must be
+; done quickly
 
 PC_SetupTimer		MACRO	TimeVal
 			mov	TL0, #LOW TimeVal
@@ -96,19 +100,23 @@ QuickQueue		MACRO	Value
 			inc	QueueEndPtr
 			ENDM
 
+; Instructions I wish existed...
 
-jnbc			MACRO	bitn, label
+jnbc			MACRO	bitn, label	; jump if no bit else clear
 			jnb	bitn, label
 			clr	bitn
 			ENDM
 
-cje			MACRO	x, y, label
+cje			MACRO	x, y, label	; compare and jump if equal
 			cjne	x, y, $+5
 			ajmp	label
 			ENDM
 
-sub			MACRO	o1, o2
+cmp			MACRO	x, y		; compare and go nowhere
+			cjne	x, y, $+3
+			ENDM
+
+sub			MACRO	o1, o2		; subtract without carry
 			clr	C
 			subb	o1, o2
 			ENDM
-
