@@ -9,8 +9,9 @@ $INCLUDE (keywedge.inc)
 
 			BSEG	at 0	; Data area containing single bit R/W registers
 
-PC_TransError:		DBIT	1	; send resend when dust settles
-Kb_TransError:		DBIT	1	; send resend when dust settles
+PC_TransError:		DBIT	1
+Kb_TransError:		DBIT	1
+Kb_Timeout:		DBIT	1
 Kb_Blocking:		DBIT	1	; we're holding the keyboard clock line low, not it
 PC_DataParity:		DBIT	1	; parity bit for outgoing data
 QueueFull:		DBIT	1	; queue can't take any more data
@@ -39,7 +40,6 @@ TransTimerMaj:		DS	1
 PollCountdown:		DS	1	; countdown to joystick poll
 
 JoystickState:		DS	NumJoysticks	; state of joystick buttons
-JoystickPrevState:	DS	NumJoysticks	; previous state for debouncing
 KeyboardState:		DS	NumJoysticks	; state of keys that map to joystick buttons
 
 StackBase:		DS	20h	; Stack grows upward from here.
@@ -48,24 +48,24 @@ StackBase:		DS	20h	; Stack grows upward from here.
 
 TransparentSwitch	BIT	DIPSwitchState.0	; power up in transparent mode
 DvorakSwitch		BIT	DIPSwitchState.1	; controls Dvorak keyboard translation
-DropWinKeySwitch	BIT	DIPSwitchState.2	; unused, but would be a nice feature
+DropWinKeySwitch	BIT	DIPSwitchState.2	; indicates we hate the winmenu key
+
+ShowKeyStateSwitch	BIT	DIPSwitchState.6	; do we want to view the keystate map
 IndicatorBankSwitch	BIT	DIPSwitchState.7	; toggles between two display modes
 
-PC_WildIndicator	BIT	LEDStateA.0
-Kb_WildIndicator	BIT	LEDStateA.1
+PC_ErrorIndicator	BIT	LEDStateA.0
+;PC_TimeoutIndicator	BIT	LEDStateA.1
 PC_BlockingIndicator	BIT	LEDStateA.2
-Kb_BlockingIndicator	BIT	LEDStateA.3
-PC_TXIndicator		BIT	LEDStateA.4
-Kb_RXIndicator		BIT	LEDStateA.5
-PC_ErrorIndicator	BIT	LEDStateA.6
-Kb_ErrorIndicator	BIT	LEDStateA.7
+PC_TXIndicator		BIT	LEDStateA.3
+Kb_ErrorIndicator	BIT	LEDStateA.4
+Kb_TimeoutIndicator	BIT	LEDStateA.5
+Kb_BlockingIndicator	BIT	LEDStateA.6
+Kb_RXIndicator		BIT	LEDStateA.7
 
-QueueNonEmptyIndicator	BIT	LEDStateB.0
-QueueFullIndicator	BIT	LEDStateB.1
-QueueOverrunIndicator	BIT	LEDStateB.2
-MetaPrefixIndicator	BIT	LEDStateB.5
-Meta2PrefixIndicator	BIT	LEDStateB.6
-ReleasePrefixIndicator	BIT	LEDStateB.7
+; ... take bits 0-4 from Kb_PrefixFlags
+QueueOverrunIndicator	BIT	LEDStateB.5
+QueueFullIndicator	BIT	LEDStateB.6
+QueueNonEmptyIndicator	BIT	LEDStateB.7
 
 Kb_PrefixMeta2Code	BIT	Kb_PrefixFlags.0	; queue E1 before next two codes from keyboard
 Kb_GetMeta2PrefixByte	BIT	Kb_PrefixFlags.1	; need the first code of an E1 sequence
@@ -105,13 +105,13 @@ ResetPt:		ajmp	Main				; <- Click here to begin
 			; done, so only use it to hide from startup conditions and backchannel data or
 			; anything else that looks like trouble.
 
-TransparentMode:	setb	Js_OutputDisable
-			setb	Js_ResetStrobe
-			clr	Js_ResetStrobe
-			mov	P1, #55h
-			clr	Js_LEDLatchStrobe
-			setb	Js_LEDLatchStrobe
-			mov	P1, #0ffh
+TransparentMode: ;	setb	Js_OutputDisable
+;			setb	Js_ResetStrobe
+;			clr	Js_ResetStrobe
+;			mov	P1, #55h
+;			clr	Js_LEDLatchStrobe
+;			setb	Js_LEDLatchStrobe
+;			mov	P1, #0ffh
 
 State00:		mov	P3, #P3_DefaultState - (0)
 			mov	TransTimerMin, #200		; 200 x 10 cycles = 1us
@@ -206,6 +206,7 @@ PC_TimerInt:		clr	PC_TimerRun
 
 Kb_EdgeInt:		clr	Kb_TimerRun
 			clr	Kb_TimerFlag
+			clr	Kb_Timeout
 			push	PSW
 			push	ACC
 			push	DPL
@@ -230,6 +231,7 @@ Kb_TimerInt:		clr	Kb_TimerRun
 			cmp	Kb_StateIndex, #1
 			cpl	C
 			mov	Kb_TransError, C
+			mov	Kb_Timeout, C
 			mov	Kb_StateIndex, #0
 			mov	Kb_PrefixFlags, #0
 			reti
@@ -285,15 +287,6 @@ Kb_EdgeTableEnd:
 
 ; ####################################################################################################
 
-			; Poll the clock line from the keyboard to see when it's released.  If it is
-			; then fall through to checking to see if it was trying to communicate.
-
-PC_PollClock:		mov	PC_StateIndex, #PC_ClockLowStatePtr-PC_TimerTable
-			jb	PC_Clock, PC_ClockRaised
-			PC_SetupTimer BlockPollTime
-			ret
-PC_ClockRaised:		setb	PC_IntEnable
-
 			; Watch the data line from the PC.  If it goes low then it's trying to talk to
 			; us.  We want to part of that, so slip into transparent mode.
 
@@ -309,6 +302,18 @@ PC_PollData:		mov	PC_StateIndex, #0
 			clr	PC_Data				; prepare start bit
 			ajmp	PC_DropClock
 PC_StayIdle:		PC_SetupTimer BackChanPollTime
+			ret
+
+			; Poll the clock line from the keyboard to see when it's released.  If it is
+			; then fall through to checking to see if it was trying to communicate.
+
+PC_PollClock:		mov	PC_StateIndex, #PC_ClockLowStatePtr-PC_TimerTable
+			jnb	PC_Clock, PC_KeepPollingClock
+			setb	PC_IntEnable
+			mov	PC_StateIndex, #0
+			PC_SetupTimer PostByteDelay		; for badly written software
+			ret
+PC_KeepPollingClock:	PC_SetupTimer BlockPollTime
 			ret
 
 			; The PC is trying to communicate.  Stay out of the way until the lines
@@ -444,7 +449,7 @@ Kb_SkipDvorak:
 			jc	Kb_Discard
 			ajmp	Kb_DontDropWinKey
 
-			; See if we need to discard a WinMenu key.
+			; See if we need to discard a WinMenu code.
 
 Kb_MetaPrefixExists:	jnb	DropWinKeySwitch, Kb_DontDropWinKey
 			cjne	A, #WinMenuCode, Kb_DontDropWinKey
@@ -495,32 +500,44 @@ KbCC_KeepLooking:	mov	A, R1
 			clr	C				; return `no conflict'
 			ret
 
-KbCC_Success:		push	ACC				; can't mess this up
+KbCC_Success:		mov	F0, C				; save carry (yes, it's still valid)
 			dec	R1				; index from above is biased -- adjust
 			push	AR1				; convert into index and mask for bit
 			mov	A, R1				; addressing purposes
-			anl	A, #07h
-			inc	A
+			anl	A, #07h				; bits 0-2 are index for one joystick
+			inc	A				; it's simpler to use a 1-based counter
 			mov	R1, A
-			mov	A, #00
+			clr	A				; convert value in R1 to a bit mask
 			setb	C
-			mov	F0, C
-KbCC_ShiftBit:		rrc	A
+KbCC_ShiftBit:		rlc	A
 			djnz	R1, KbCC_ShiftBit
-			mov	C, F0
+			mov	R1, A				; save bit mask
+			pop	ACC				; get original index...
+			anl	A, #0f8h			; ...and divide it by 8
+			rr	A
+			rr	A
+			rr	A
+			add	A, #KeyboardState		; make it a useful pointer
+			xch	A, R1				; put things in the right place
+			jb	F0, KbCC_IsReleaseCode
+			clr	C
+			orl	A, @R1				; set keyboard state bit
+			mov	@R1, A
+			ajmp	KbCC_WasPressCode
+KbCC_IsReleaseCode:	push	ACC
+			cpl	A				; clear keyboard state bit
+			anl	A, @R1
+			mov	@R1, A
 			pop	ACC
-			anl	#0f8h
-			rr	A
-			rr	A
-			rr	A
-			mov	R1, A
-
-
-			pop	ACC
+			xch	A, R1
+			add	A, #JoystickState-KeyboardState
+			xch	A, R1
+			anl	A, @R1				; check the equiv. joystick state
+			mov	C, P				; parity happens to indicate zero/non
+KbCC_WasPressCode:	mov	A, R2
 			pop	AR2
 			pop	AR1
 			ret
-
 
 ; ####################################################################################################
 
@@ -532,7 +549,7 @@ QB_PressOnly:		QuickQueue A
 			clr	PC_TimerRun
 			clr	EA
 			cjne	PC_StateIndex, #0, QB_JustQueueIt
-			PC_SetupTimer 0ffffh			; Draw ISR's attention
+			PC_SetupTimer 0ffffh			; get ISR's attention
 QB_JustQueueIt:		setb	EA
 			setb	PC_TimerRun
 			cmp	QueueEndPtr, #QueueBase+QueueThreshold
@@ -602,14 +619,6 @@ PAJ_Loop:		push	AR2
 PollJoystick:		acall	NextJoystick
 			mov	A, JoystickPort			; Get the data
 
-			push	AR1
-			xch	A, R1				; Change to address previous state
-			add	A, #JoystickPrevState-JoystickState
-			xch	A, R1
-			xch	A, @R1				; Update previous state
-			orl	A, @R1				; Debounce
-			pop	AR1
-
 			mov	R2, A
 			xch	A, @R1				; Update the current state
 			xrl	A, @R1				; Get a list of changes
@@ -666,10 +675,17 @@ NextJoystick:		setb	Js_OutputDisable
 ForceLEDUpdate:		setb	Js_OutputDisable
 			setb	Js_ResetStrobe
 			clr	Js_ResetStrobe
-			mov	A, LEDStateA
-			jnb	IndicatorBankSwitch, FLU_BankAOK
+			jnb	ShowKeyStateSwitch, FLU_ShowStatus
+;			mov	A, KeyboardState
+			mov	A, PC_ShiftBuffer
+			jnb	IndicatorBankSwitch, FLU_ShowThis
+;			mov	A, JoystickState
+			mov	A, Kb_ShiftBuffer
+			ajmp	FLU_ShowThis
+FLU_ShowStatus:		mov	A, LEDStateA
+			jnb	IndicatorBankSwitch, FLU_ShowThis
 			mov	A, LEDStateB
-FLU_BankAOK:		mov	P1, A
+FLU_ShowThis:		mov	P1, A
 			clr	Js_LEDLatchStrobe
 			setb	Js_LEDLatchStrobe
 			mov	P1, #0ffh
@@ -694,24 +710,24 @@ ForceDIPSwitchUpdate:	acall	ForceLEDUpdate
 UpdateIndicators:	cmp	PC_StateIndex, #PC_SendStatePtr+2-PC_TimerTable
 			cpl	C
 			mov	PC_TXIndicator, C
-			cmp	Kb_StateIndex, #2
-			cpl	C
-			mov	Kb_RXIndicator, C
-			mov	C, PC_TransError
-			mov	PC_ErrorIndicator, C
-			mov	C, Kb_TransError
-			mov	Kb_ErrorIndicator, C
-			mov	C, Kb_Blocking
-			mov	Kb_BlockingIndicator, C
+			mov	C, Kb_Timeout
+			mov	Kb_TimeoutIndicator, C
 			clr	PC_BlockingIndicator
 			cjne	PC_StateIndex, #PC_ClockLowStatePtr-PC_TimerTable, UI_PC_NotBlocking
 			setb	PC_BlockingIndicator
-UI_PC_NotBlocking:	cmp	PC_StateIndex, #PC_TimerTableEnd-PC_TimerTable
+UI_PC_NotBlocking:	mov	C, PC_TransError
+			mov	PC_ErrorIndicator, C
+
+			cmp	Kb_StateIndex, #2
 			cpl	C
-			mov	PC_WildIndicator, C
-			cmp	Kb_StateIndex, #Kb_EdgeTableEnd-Kb_EdgeTable
-			cpl	C
-			mov	Kb_WildIndicator, C
+			mov	Kb_RXIndicator, C
+			mov	C, Kb_Blocking
+			mov	Kb_BlockingIndicator, C
+			mov	C, Kb_TransError
+			mov	Kb_ErrorIndicator, C
+
+			mov	A, Kb_PrefixFlags
+			mov	LEDStateB, A
 			mov	A, QueueEndPtr
 			cmp	A, #QueueBase+1
 			cpl	C
@@ -722,23 +738,17 @@ UI_PC_NotBlocking:	cmp	PC_StateIndex, #PC_TimerTableEnd-PC_TimerTable
 			cmp	A, #QueueBase+QueueLength
 			cpl	C
 			mov	QueueOverrunIndicator, C
-			mov	C, Kb_PrefixMetaCode
-			mov	MetaPrefixIndicator, C
-			mov	C, Kb_PrefixMeta2Code
-			mov	Meta2PrefixIndicator, C
-			mov	C, Kb_PrefixReleaseCode
-			mov	ReleasePrefixIndicator, C
 			ret
 
 ; ####################################################################################################
 
-Main:			mov	IE, #0
-			mov	SP, #StackBase - 1		; set up general operating parameters
-			mov	P1, #0ffh
-			mov	P3, #P3_DefaultState
+Main:			mov	IE, #0				; block ints (in case not usual reset)
+			mov	SP, #StackBase - 1		; set up a stack
+			mov	P1, #0ffh			; safe P1 output
+			mov	P3, #P3_DefaultState		; safe P3 output
 			mov	TCON, #04h
-			mov	TMOD, #11h
-			mov	IP, #06h
+			mov	TMOD, #11h			; both timers 16bit
+			mov	IP, #04h			; prioritise only the keyboard ISR
 			mov	R0, #127			; wipe everything to make sure
 			clr	A
 ClearRAMLoop:		mov	@R0, A				; misses address 0, but R0 _is_
@@ -754,8 +764,8 @@ ClearRAMLoop:		mov	@R0, A				; misses address 0, but R0 _is_
 MainLoop:		acall	UpdateIndicators		; see what's going on
 			acall	ForceLEDUpdate			; show it to the world
 			djnz	PollCountdown, MainLoop
-			mov	PollCountdown, #64		; poll joysticks every 128 iterations
-			acall	PollAllJoysticks		; of above.  Around 480Hz
+;			mov	PollCountdown, #0		; poll joysticks every 256 iterations
+			acall	PollAllJoysticks		; of above.  Around 400Hz
 			ajmp	MainLoop
 
 ; ####################################################################################################
