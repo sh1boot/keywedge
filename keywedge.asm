@@ -1,6 +1,14 @@
+; 8051 Keyboard Wedge, by Simon Hosie - 1997,1998,2000
+;
+;	Inserts scancodes into the datastream between a keyboard and PC
+;	representing the movements on outdated microcomputer joysticks.
+;
+;	Source code is meant to be viewed on a 132 column screen.
+
 $INCLUDE (keywedge.inc)
 
-			BSEG	at 0
+			BSEG	at 0	; Data area containing single bit R/W registers
+
 PC_TransError:		DBIT	1	; send resend when dust settles
 Kb_TransError:		DBIT	1	; send resend when dust settles
 
@@ -56,10 +64,10 @@ StackBase:		DS	20h	; put the stack here
 
 ; ----------------------------------------------------------------------------------------------
 
-TransparentSwitch	BIT	DIPSwitchState.0
-DvorakSwitch		BIT	DIPSwitchState.1
-DropWinkeySwitch	BIT	DIPSwitchState.2
-IndicatorBankSwitch	BIT	DIPSwitchState.7
+TransparentSwitch	BIT	DIPSwitchState.0	; Power up in braindead mode
+DvorakSwitch		BIT	DIPSwitchState.1	; controls Dvorak keyboard translation
+DropWinkeySwitch	BIT	DIPSwitchState.2	; unused, but would be a nice feature
+IndicatorBankSwitch	BIT	DIPSwitchState.7	; toggles between two display modes
 
 PC_TXIndicator		BIT	LEDStateA.0
 PC_RXIndicator		BIT	LEDStateA.1
@@ -103,8 +111,19 @@ ResetPt:		ajmp	Main				; <- Click here to begin
 			CSEG	at TIMER1
 			ajmp	Kb_TimerInt			; keyboard timed out or
 								; miscellaneous event
+
 ; ##############################################################################################
 ; ##############################################################################################
+
+; 'Super Hoopy Data Throughpy' transparency mode.
+;	State machine to minimise response times to changes in lines, useful
+;	for situations that can't be resolved by general simulation such as
+;	unexpected protocol extensions or strange powerup conditions.
+
+;	Each state begins by setting outputs to match inputs, then waiting
+;	for an input to change and branching to the new state which will in
+;	turn reconfigure outputs to fit and wait for the next change. 
+;	Extremely inefficient in terms of ROM usage, but reliable.
 
 TransparentMode:
 State00:		mov	P3, #P3_DefaultState - (0)
@@ -167,7 +186,7 @@ State22L:		jb	Kb_Clock, State02
 ; ##############################################################################################
 ; ##############################################################################################
 
-JmpAPlusDPtr:		jmp	@A+DPTR
+JmpAPlusDPtr:		jmp	@A+DPTR				; used in lieu of a relative call
 
 PC_TimerTable:		nop
 			nop
@@ -247,6 +266,11 @@ Kb_EdgeTable:
 ; ##############################################################################################
 ; ##############################################################################################
 
+; If the PC clock line is driven low while this IRQ is enabled then we
+; didn't expect it.  Abandon any data transfer and start polling the line at
+; a moderate rate.  Thus far there is no reason to abort any communications
+; with the keyboard or stop polling joysticks.
+
 PC_LowInt:		mov	PC_StateIndex, #PC_LowClockStatePtr - PC_TimerTable
 			PC_SetupTimer BlockPollTime
 			reti
@@ -285,13 +309,28 @@ Kb_WithoutTimeout:	pop	DPH
 
 ; ----------------------------------------------------------------------------------------------
 
+; Check all sorts of miscellaneous conditions here.  The keyboard timeout is
+; the least timing critical and so it's multiplexed with other non-critical
+; timers.
+;
+; If the PowerupTimeout bit is set then we're currently pretending to be
+; transparent for fear of striking trouble with the power up sequence. 
+; Count that down and at timeout break out of the currently running
+; function.
+;
+; If the Kb_SendSetup bit is set then we've been holding the clock and data
+; lines low to indicate to the keyboard that we want to send data.  That
+; time is up, so begin the transfer.
+;
+; Otherwise something has gone wrong.  Flag the transfer as bad.
+
 Kb_TimerInt:		jb	PowerupTimeout, PowerupInt
 			clr	Kb_TimerRun
 			jbc	Kb_SendSetup, Kb_StartTransfer
 			clr	Kb_ToRespondNow
 			push	PSW
 			cjne	Kb_StateIndex, #0, Kb_TransTimeout
-			clr	Kb_ToRespondNow
+;			clr	Kb_ToRespondNow
 			pop	PSW
 			reti
 Kb_TransTimeout:	setb	Kb_TransError
@@ -307,11 +346,14 @@ Kb_StartTransfer:	clr	Kb_IntFlag
 PowerupInt:		djnz    PowerupCountdown, PowerupDontFinish
 			clr	PowerupTimeout
 			clr	Kb_TimerRun
-			dec	SP
-			dec	SP
+			dec	SP				; break out of current function
+			dec	SP				; (known to be TransparentMode)
 PowerupDontFinish:	reti
 
 ; ##############################################################################################
+
+; A bunch of small modules that are executed as dictated by the jump tables. 
+; Each module does little or no more than what its label indicates.
 
 PC_RaiseClock:		setb	PC_Clock
 			setb	PC_IntEnable
@@ -336,7 +378,7 @@ PC_SendParityBit:	clr	A
 			mov	C, P
 			cpl	C
 			mov	PC_Data, C
-			cje	A, #ResendCode, PC_DropClock
+			cje	A, #ResendCode, PC_DropClock	; don't log RESEND for resending
 			mov	PC_LastByteSent, A
 			ajmp	PC_DropClock
 
@@ -345,9 +387,9 @@ PC_SendStopBit:		setb	PC_Data
 
 PC_FinishSend:		setb	PC_Clock
 			setb	PC_IntEnable
-			setb	PC_Data
+			setb	PC_Data				; being cautious
 			acall	PC_SentByte
-			PC_SetupTimer PostByteDelay
+			PC_SetupTimer PostByteDelay		; for badly written software
 			ret
 
 PC_SendNextOrIdle:	mov	PC_StateIndex, #0
@@ -417,6 +459,8 @@ PC_JustBlocking:	mov	PC_StateIndex, #PC_NextByteStatePtr - PC_TimerTable
 			PC_SetupTimer PostByteDelay
 			ret
 
+; ----------------------------------------------------------------------------------------------
+
 Kb_RecvStartBit:	mov	C, Kb_Data
 			mov	Kb_TransError, C
 			ret
@@ -482,10 +526,16 @@ Kb_AckFailed:		ret
 
 ; ##############################################################################################
 
+; We got a byte from the PC.  All we know how to do is send it on to the
+; keyboard and wait for its response.
+
 PC_GotByte:		setb	Kb_ToRespondNow
 			ajmp	Kb_StartSend
 
 ; ----------------------------------------------------------------------------------------------
+
+; We sent a byte to the PC successfully.  If it came from the queue then get
+; rid of it.
 
 PC_SentByte:		jnbc	PC_ByteFromQueue, PCSB_DontUnqueue
 			ajmp	UnqueueByte
@@ -493,14 +543,18 @@ PCSB_DontUnqueue:	ret
 
 ; ----------------------------------------------------------------------------------------------
 
+; We got a byte from the keyboard.  If we were expecting a response to a
+; command then check that it's valid and send it on if it is, if not then
+; keep waiting until timeout.  Otherwise analyse and/or queue it.
+
 Kb_GotByte:		jnb	Kb_ToRespondNow, Kb_DontRespondNow
 			jnb	ACC.7, Kb_NotResponseCode	; scancodes aren't responses
 			cje	A, #83h, Kb_NotResponseCode	; F7 is a confused key
 			cje	A, #MetaCode, Kb_NotResponseCode
 			cje	A, #Meta2Code, Kb_NotResponseCode
 			cje	A, #ReleaseCode, Kb_NotResponseCode
-			clr	Kb_ToRespondNow
-			ajmp	PC_StartSend
+			clr	Kb_ToRespondNow			; we got something we can use as
+			ajmp	PC_StartSend			; a response
 Kb_NotResponseCode:	Kb_SetupTimer ResponseTimeout
 
 Kb_DontRespondNow:	jbc     Kb_GetMeta2PrefixByte, Kb_GotMeta2PrefixByte
@@ -516,15 +570,15 @@ Kb_NotMeta2Code:	cjne	A, #ReleaseCode, Kb_NotReleaseCode
 			setb	Kb_PrefixReleaseCode
 			ret
 
-	; ...input translation done, now try to output the thing...
-
 Kb_NotReleaseCode:	jnb	DvorakSwitch, Kb_DontTranslateIt
-			cjne	A, #15h, $+3
+			cmp	A, #15h
 			jc	Kb_DontTranslateIt
-			cjne	A, #5ch, $+3
+			cmp	A, #5ch
 			jnc	Kb_DontTranslateIt
 			mov	DPTR, #DvorakTransTable - 15h
 			movc	A, @A+DPTR
+
+	; ...input translation done, now try to output the thing...
 
 Kb_DontTranslateIt:	jb      Kb_PrefixMeta2Code, Kb_DontDiscard
 			jb      Kb_PrefixMetaCode, Kb_DontDiscard
@@ -559,6 +613,8 @@ Kb_NotReleaseCode_2:	mov	Kb_Meta2PrefixByte, A
 
 ; ----------------------------------------------------------------------------------------------
 
+; We send a byte to the keyboard successfully.  Expect a reply.
+
 Kb_SentByte:		Kb_SetupTimer ResponseTimeout
 			setb	Kb_ToRespondNow
 			ret
@@ -588,6 +644,8 @@ Kb_StartSend:		clr	Kb_IntEnable
 			ret
 
 ; ##############################################################################################
+
+; See if this code is already marked as being down.
 
 Kb_CheckCode:		push	ACC
 			push	AR1
@@ -628,7 +686,7 @@ KbCC_ConsiderBlocking:	add	A, #JoystickState
 
 ; ----------------------------------------------------------------------------------------------
 
-FindScanCode:		mov	DPTR, #DefaultJoystickCodes
+FindScanCode:		mov	DPTR, #JoystickCodes
 			push	AR2
 			mov	R2, A
 			mov	R1, #NumJoysticks * 8
@@ -695,21 +753,21 @@ QB_PressOnly:		QuickQueue A
 			setb	PC_ByteFromQueue
 			acall	PC_StartSend
 			pop	ACC
-QB_JustQueueIt:		cjne	QueueEndPtr, #QueueBase+QueueThreshold, $+3
+QB_JustQueueIt:		cmp	QueueEndPtr, #QueueBase+QueueThreshold
 			cpl	C
 			mov	QueueFull, C
 			ret
 
 ; ----------------------------------------------------------------------------------------------
 
-PeekQueue:		cjne	QueueEndPtr, #QueueBase+1, $+3
+PeekQueue:		cmp	QueueEndPtr, #QueueBase+1
 			mov	A, QueueBase
 			ret
 
 ; ----------------------------------------------------------------------------------------------
 
 UnqueueByte:		clr	A
-			cjne	QueueEndPtr, #QueueBase+1, $+3
+			cmp	QueueEndPtr, #QueueBase+1
 			jc	UB_QueueEmpty
 			clr	EA
 			dec	QueueEndPtr
@@ -723,7 +781,7 @@ UB_LoopEntry:		dec	R1
 			cjne	R1, #QueueBase-1, UB_Loop
 			pop	AR1
 UB_QueueEmpty:		mov	F0, C
-			cjne	QueueEndPtr, #QueueBase+QueueThreshold, $+3
+			cmp	QueueEndPtr, #QueueBase+QueueThreshold
 			cpl	C
 			mov	QueueFull, C
 			jc	UB_DontUnblock
@@ -741,7 +799,7 @@ UB_UnqueueAndUnblock:	clr	Kb_Blocking
 
 PollAllJoysticks:	acall	ForceDIPSwitchUpdate
 			mov	R1, #JoystickState
-			mov	DPTR, #DefaultJoystickCodes
+			mov	DPTR, #JoystickCodes
 			mov	R2, #NumJoysticks
 PAJ_Loop:		push	AR2
 			acall	PollJoystick
@@ -796,11 +854,6 @@ PJ_NotThisBit:		rr	A
 
 ; ##############################################################################################
 
-ForceDIPSwitchUpdate:	acall	ForceLEDUpdate
-			acall	NextJoystick
-			mov	DIPSwitchState, P1
-			ret
-
 ForceLEDUpdate:		setb	Js_OutputDisable
 			setb	Js_ResetStrobe
 			clr	Js_ResetStrobe
@@ -815,36 +868,47 @@ FLU_BankAOK:		mov	P1, A
 
 NextJoystick:		setb	Js_OutputDisable
 			clr	Js_IncrementStrobe
-			nop
 			setb	Js_IncrementStrobe
 			clr	Js_OutputDisable
 			ret
 
+ForceDIPSwitchUpdate:	acall	ForceLEDUpdate
+			acall	NextJoystick
+			mov	DIPSwitchState, P1
+			ret
+
 ; ##############################################################################################
 
-UpdateIndicators:	cjne	PC_StateIndex, #PC_SendStatePtr-PC_TimerTable, $+3
+; Basically just show a whole lot of rubbish on the LEDs for debugging. 
+; This is redundant once the code is deemed functional, but there's no good
+; reason to remove it unless half the ROM goes missing or something like
+; that.  If you don't need it then don't mount those components on the PCB. 
+; Maybe someone will build an extension module to control disco lights based
+; on keystrokes.
+
+UpdateIndicators:	cmp	PC_StateIndex, #PC_SendStatePtr-PC_TimerTable
 			mov	F0, C
-			cjne	PC_StateIndex, #PC_NextByteStatePtr-PC_TimerTable, $+3
+			cmp	PC_StateIndex, #PC_NextByteStatePtr-PC_TimerTable
 			anl	C, /F0
 			mov	PC_TXIndicator, C
 
-			cjne	PC_StateIndex, #PC_RecvStatePtr-PC_TimerTable, $+3
+			cmp	PC_StateIndex, #PC_RecvStatePtr-PC_TimerTable
 			mov	F0, C
-			cjne	PC_StateIndex, #PC_LowClockStatePtr-PC_TimerTable, $+3
+			cmp	PC_StateIndex, #PC_LowClockStatePtr-PC_TimerTable
 			anl	C, /F0
 			mov	PC_RXIndicator, C
 
-			cjne	Kb_StateIndex, #Kb_SendStatePtr-Kb_EdgeTable, $+3
+			cmp	Kb_StateIndex, #Kb_SendStatePtr-Kb_EdgeTable
 			cpl	C
 			mov	Kb_TXIndicator, C
 
-			cjne	Kb_StateIndex, #Kb_WaitingStatePtr+2-Kb_EdgeTable, $+3
+			cmp	Kb_StateIndex, #Kb_WaitingStatePtr+2-Kb_EdgeTable
 			mov	F0, C
-			cjne	Kb_StateIndex, #Kb_SendStatePtr-Kb_EdgeTable, $+3
+			cmp	Kb_StateIndex, #Kb_SendStatePtr-Kb_EdgeTable
 			anl	C, /F0
 			mov	Kb_RXIndicator, C
 
-			cjne	PC_StateIndex, #PC_LowClockStatePtr-PC_TimerTable, $+3
+			cmp	PC_StateIndex, #PC_LowClockStatePtr-PC_TimerTable
 			cpl	C
 			mov	PC_BlockingIndicator, C
 
@@ -852,11 +916,11 @@ UpdateIndicators:	cjne	PC_StateIndex, #PC_SendStatePtr-PC_TimerTable, $+3
 			mov	Kb_BlockingIndicator, C
 
 			mov	A, QueueEndPtr
-			cjne	A, #QueueBase+QueueThreshold, $+3
+			cmp	A, #QueueBase+QueueThreshold
 			cpl	C
 			mov	QueueFullIndicator, C
 
-			cjne	A, #QueueBase+QueueLength, $+3
+			cmp	A, #QueueBase+QueueLength
 			cpl	C
 			mov	QueueOverrunIndicator, C
 
@@ -888,48 +952,51 @@ Main:			mov	IE, #0
 			mov	R0, #127			; wipe everything to make sure
 			clr	A
 ClearRAMLoop:		mov	@R0, A
-			djnz	R0, ClearRAMLoop
+			djnz	R0, ClearRAMLoop		; misses address 0, but R0 is
+								; address zero, so it's OK.
 
 			mov	QueueEndPtr, #QueueBase		; set up variables
 
 			clr	Js_ResetStrobe
 			setb	Js_ResetStrobe			; reset address chip with two
-			clr	Js_ResetStrobe			; _good_ edges
+			clr	Js_ResetStrobe			; _good_ edges (however the
+								; lines were waggled before is
+								; undefined)
 
 			mov	IE, #08h			; prepare timer 1 only
 
 			mov	LEDStateA, #033h		; show that we're in
 			acall	ForceDIPSwitchUpdate		; transparent mode
 
-			mov	PowerupCountdown, #99h		; about 5 seconds
-			setb	PowerupTimeout
+			mov	PowerupCountdown, #4ch		; about 2.5 seconds
+			setb	PowerupTimeout			; timer is for transparency
 			setb	Kb_TimerRun
-			mov	C, TransparentSwitch
-			cpl	C
-			mov	EA, C
-			acall	TransparentMode			; God knows whats happening on
-								; powerup - just keep out of
-								; the way
+			mov	C, TransparentSwitch		; if switched into transparent
+			cpl	C				; mode then...
+			mov	EA, C				; ...never timeout
+			acall	TransparentMode			; Powerup conditions unknown, just
+								; keep out of the way
+
 			mov	IE, #8fh			; enable all interrupts
 			mov	LEDStateA, #00h			; clear 
 
 MainLoop:		acall	UpdateIndicators		; see what's going on
 			acall	ForceLEDUpdate			; show it to the world
 			djnz	PollCountdown, MainLoop
-			acall	PollAllJoysticks		; poll joysticks at about 120Hz
-			ajmp	MainLoop
+			acall	PollAllJoysticks		; poll joysticks every 256
+			ajmp	MainLoop			; iterations of above (~80Hz)
 
 ; ##############################################################################################
 
-			;	up   dn	  lf   rt   b3	 b1   b2   b4
-DefaultJoystickCodes:	DB	75h, 72h, 6bh, 74h, 11h, 5ah, 14h, 11h
-			DB	16h, 1eh, 15h, 1dh, 1ch, 1bh, 1ah, 22h
-			DB	26h, 25h, 24h, 2dh, 23h, 2bh, 21h, 2ah
-			DB	2eh, 36h, 2ch, 35h, 34h, 33h, 32h, 31h
-			DB	3dh, 3eh, 3ch, 43h, 3bh, 42h, 3ah, 41h
-			DB	46h, 45h, 44h, 4dh, 4bh, 4ch, 49h, 4ah
-			DB	4eh, 55h, 54h, 5bh, 52h, 0eh, 0dh, 12h
-			DB	03h, 0bh, 83h, 0ah, 01h, 09h, 78h, 07h
+			;	up   down left rght btn3 btn1 btn2 btn4
+JoystickCodes:		DB	75h, 72h, 6bh, 74h, 71h, 5ah, 70h, 73h	; cursors
+			DB	1bh, 22h, 1ah, 21h, 2ah, 23h, 2bh, 1ch	; bottom left alpha
+			DB	42h, 41h, 3ah, 49h, 4ah, 4bh, 4ch, 42h	; bottom middle alpha
+			DB	1eh, 1dh, 15h, 24h, 2dh, 26h, 25h, 16h	; top left alpha
+			DB	36h, 35h, 2ch, 3ch, 43h, 3dh, 3eh, 2eh	; top middle alpha
+			DB	45h, 4dh, 44h, 54h, 5bh, 4eh, 55h, 46h	; top right alpha
+			DB	4ch, 4ah, 49h, 59h, 52h, 66h, 5dh, 29h 	; leftover keys
+			DB	03h, 0bh, 83h, 0ah, 01h, 09h, 78h, 07h	; function keys
 
 DvorakTransTable:	DB	                         52h, 16h, 17h
 			DB	18h, 19h, 4ch, 44h, 1ch, 41h, 1eh, 1fh
@@ -944,4 +1011,4 @@ DvorakTransTable:	DB	                         52h, 16h, 17h
 
 ; ##############################################################################################
 
-			END
+			END		; stop reading... now!
